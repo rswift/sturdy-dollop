@@ -1,0 +1,394 @@
+#
+# Provisions an API Gateway with HTTP API + Lambda Authoriser, and a backend function
+#
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Creates an API Gateway with HTTP API + Lambda Authoriser plus a backend function # APIGatewayHTTPAPIWithLambdaAuthoriser
+
+Parameters:
+  StageName:
+    Type: String
+    Description: The name of the API Gateway stage
+    MinLength: 1
+    MaxLength: 10
+    Default: test
+    AllowedPattern: ^[A-Za-z]{1,10}$
+    ConstraintDescription: The stage name is constrained to between 1 and 10 upper or lower case characters
+
+  AuthoriserFunctionName:
+    Type: String
+    Description: The name of the Lambda Authoriser function
+    MinLength: 1
+    MaxLength: 50
+    Default: authoriser
+    AllowedPattern: ^[a-z0-9]{1,50}$
+    ConstraintDescription: Lowercase name for the authoriser function, 1-50 characters or digits
+
+  BackendFunctionName:
+    Type: String
+    Description: The name of the API Gateway backend Integration function
+    MinLength: 1
+    MaxLength: 50
+    Default: backend
+    AllowedPattern: ^[a-z0-9]{1,50}$
+    ConstraintDescription: Lowercase name for the backend function, 1-50 characters or digits
+
+  EnableCaching:
+    Type: String
+    Description: Enable authoriser results caching, if Yes, cache is set to 30 seconds
+    Default: "No"
+    AllowedValues: ["Yes", "No"]
+
+  LambdaLogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: ["INFO", "DEBUG"]
+
+  LogGroupRetention:
+    Description: Lambda log retention in days
+    Type: Number
+    Default: 30
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+      - 400
+      - 545
+      - 731
+      - 1827
+      - 3653
+
+Conditions:
+  CachingEnabled: !Equals [ !Ref EnableCaching, 'Yes' ]
+
+Resources:
+  #
+  # Authoriser 👍 👎
+  #
+  AuthoriserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref AuthoriserFunctionName
+      Description: Validates API Gateway requests for HTTP API calls
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Timeout: 10
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          #
+          # WARNING! This function is written for exploration and is of dubious integrity!
+          #
+          # DO NOT USE FOR ANYTHING OTHER THAN LEARNING!
+          #
+
+          import logging
+          import os
+          from random import choice
+
+          #
+          # tinkerings to explore API Gateway HTTP Lambda Authoriser
+          #
+          # https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-lambda.html
+          #
+
+          log_level = os.environ['LOG_LEVEL'] if 'LOG_LEVEL' in os.environ else 'INFO'
+          logging_levels = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR, "CRITICAL": logging.CRITICAL}
+          logging_level = logging_levels[log_level] if log_level in logging_levels else logging.INFO
+
+          logger = logging.getLogger()
+          logger.setLevel(logging_level)
+
+          authorisation_header = "Authorization".lower() # a half hearted search didn't turn up much, but request headers seem to be sent to the function all lower case
+
+
+          def lambda_handler(event, context):
+              logger.info(f"{context.function_name} ({context.function_version}) with event: {event}")
+
+              response = { "isAuthorized": False, "context":{}}
+
+              if authorisation_header in event['headers']:
+                  authorisation_token = event['headers'][authorisation_header]
+                  logger.debug(f"Received [{authorisation_token}] in header field '{authorisation_header}'")
+              else:
+                  logger.error(f"Authorisation header '{authorisation_header}' not found in request headers, headers received: {[k for k in event['headers'].keys()]}")
+                  return response # exit here for a tad more clarity...
+
+              if authorisation_token == "random-horse:battery/staple":
+                  response['isAuthorized'] = choice([True, False])
+                  response['context']['outcome'] = "Outcome set from a random choice"
+              elif authorisation_token == "correct-horse:battery/staple":
+                  response['isAuthorized'] = True
+                  response['context']['outcome'] = "Outcome is XKCD"
+              else:
+                  logger.warn(f"Authorisation token [{authorisation_token}] supplied in header field '{authorisation_header}' has not proven itself worthy...")
+                  response['context']['outcome'] = "Outcome is failed authorisation!"
+
+              logger.debug(f"Authoriser returning: {response=}")
+              return response
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LambdaLogLevel
+      Role: !GetAtt AuthoriserExecutionRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Ref AuthoriserFunctionName
+
+  AuthoriserExecutionRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RoleName: Authoriser
+      Description: Enabler for the HTTP API Lambda Authoriser
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - !Ref AuthoriserExecutionRolePolicy
+      Tags:
+        - Key: Name
+          Value: Authoriser
+
+  AuthoriserExecutionRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      ManagedPolicyName: HTTPAPILambdaAuthoriser
+      Description: Permits Lambda to write to CloudWatch Logs
+      Path: /
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PermitPutCloudWatchLogEvents # no need for logs:CreateLogGroup as this is taken care of via AuthoriserLogGroup
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !GetAtt AuthoriserLogGroup.Arn
+
+  PermissionForAPIGatewayHTTPAPIAuthoriser:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthoriserFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub
+      - "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${apiId}/authorizers/${authoriserId}"
+      - { apiId: !Ref HTTPAPI, authoriserId: !Ref HTTPAPIAuthoriser }
+
+  AuthoriserLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+      - /aws/lambda/${functionname}
+      - { functionname: !Ref AuthoriserFunctionName }
+      RetentionInDays: !Ref LogGroupRetention # create manually to be able to set a retention period
+
+  #
+  # Backend 🔮
+  #
+  BackendFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref BackendFunctionName
+      Description: Ridiculously insecure API Gateway HTTP API backend Integration
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Timeout: 10
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          #
+          # WARNING! This function is written for exploration and is mahoosively insecure
+          #
+          # DO NOT USE FOR ANYTHING OTHER THAN LEARNING!
+          #
+
+          import logging
+          import os
+
+          log_level = os.environ['LOG_LEVEL'] if 'LOG_LEVEL' in os.environ else 'INFO'
+          logging_levels = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR, "CRITICAL": logging.CRITICAL}
+          logging_level = logging_levels[log_level] if log_level in logging_levels else logging.INFO
+
+          logger = logging.getLogger()
+          logger.setLevel(logging_level)
+
+
+          def lambda_handler(event, context):
+              logger.info(f"{context.function_name} ({ context.function_version}) with event: {event}")
+
+              logger.warn("WARNING: This function returns the entire contents of the 'event' object received by the function, straight back to the client!")
+              return {"event": event}
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LambdaLogLevel
+      Role: !GetAtt BackendExecutionRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Ref BackendFunctionName
+
+  BackendExecutionRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RoleName: Backend
+      Description: Enabler for the HTTP API backend
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - !Ref BackendExecutionRolePolicy
+      Tags:
+        - Key: Name
+          Value: Backend
+
+  BackendExecutionRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      ManagedPolicyName: HTTPAPILambdaBackend
+      Description: Permits Lambda to write to CloudWatch Logs
+      Path: /
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PermitPutCloudWatchLogEvents # no need for logs:CreateLogGroup as this is taken care of via BackendLogGroup
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !GetAtt BackendLogGroup.Arn
+
+  PermissionForAPIGatewayHTTPAPI:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BackendFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub
+      - "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${apiId}/*/$default" # this needs to align to the RouteKey in HTTPAPIRoute
+      - { apiId: !Ref HTTPAPI }
+
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+      - /aws/lambda/${functionname}
+      - { functionname: !Ref BackendFunctionName }
+      RetentionInDays: !Ref LogGroupRetention # create manually to be able to set a retention period
+
+  #
+  # HTTP API 🧰
+  #
+  HTTPAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: LambdaAuthoriser
+      Description: Highly Insecure API exploring Lambda Authorisers
+      ProtocolType: HTTP
+      Tags:
+        Name: LambdaAuthoriser
+        WARNING: This API is highly insecure and should be used with caution
+
+  HTTPAPIAuthoriser:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties: 
+      Name: !Ref AuthoriserFunctionName
+      ApiId: !Ref HTTPAPI
+      AuthorizerType: REQUEST
+      AuthorizerPayloadFormatVersion: 2.0
+      AuthorizerUri: !Sub
+      - "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${functionArn}/invocations"
+      - { functionArn: !GetAtt AuthoriserFunction.Arn }
+      AuthorizerResultTtlInSeconds: !If [CachingEnabled, 30, 0]
+      EnableSimpleResponses: true
+      IdentitySource: 
+        - $request.header.Authorization # this needs to align with the authorisation_header value in the authoriser function
+
+  HTTPAPIBackend:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      Description: Ridiculously insecure backend for the API 😱
+      ApiId: !Ref HTTPAPI
+      IntegrationType: AWS_PROXY
+      IntegrationMethod: POST
+      IntegrationUri: !GetAtt BackendFunction.Arn
+      PayloadFormatVersion: 2.0
+
+  HTTPAPIRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HTTPAPI
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref HTTPAPIAuthoriser
+      RouteKey: $default # see comment above for same parameter in HTTPAPI
+      Target: !Sub
+      - "integrations/${target}"
+      - { target: !Ref HTTPAPIBackend }
+
+  HTTPAPIStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: !Ref StageName
+      Description: I suppose I should think of something witty, but it is late, so ¯\_(ツ)_/¯
+      ApiId: !Ref HTTPAPI
+      AccessLogSettings: # adjust to taste...
+        DestinationArn: !GetAtt HTTPAPILogGroup.Arn
+        Format: '{"requestId": "$context.requestId", "ip": "$context.identity.sourceIp", "requestTime": "$context.requestTime", "httpMethod": "$context.httpMethod", "routeKey": "$context.routeKey", "status": "$context.status", "protocol": "$context.protocol", "responseLength": "$context.responseLength", "authoriserError": "$context.authorizer.error"}'
+      DefaultRouteSettings: 
+        DetailedMetricsEnabled: true
+
+  HTTPAPIDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+    - HTTPAPIRoute
+    - HTTPAPIAuthoriser
+    - HTTPAPIStage
+    Properties:
+      ApiId: !Ref HTTPAPI
+      StageName: !Ref StageName
+      Description: !Sub "CloudFormation initiated deployment from Stack ${AWS::StackName}"
+
+  HTTPAPILogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+      - "/api/LambdaAuthoriser/${stage}"
+      - { stage: !Ref StageName }
+      RetentionInDays: !Ref LogGroupRetention # create manually to be able to set a retention period
+
+Outputs:
+  URL:
+    Description: Full URL of the API
+    Value: !Sub
+    - "${base}/${stage}"
+    - { base: !GetAtt HTTPAPI.ApiEndpoint, stage: !Ref StageName }
